@@ -95,9 +95,17 @@ class Worker:
                 self.worker_id,
                 self.settings.lease_seconds,
             )
-            if lease is not None:
-                self.lease = lease
-                return True
+            if lease is None:
+                continue
+            # ``claimable_jobs`` is a snapshot: another worker may have
+            # completed the job between that read and this acquisition.  Never
+            # start a "training run" on a finished job.
+            job = store.get_job(self.settings.db_path, job_id)
+            if job is None or job["status"] == "completed":
+                lease_mod.release(self.settings.db_path, lease)
+                continue
+            self.lease = lease
+            return True
         return False
 
     def _train(self) -> None:

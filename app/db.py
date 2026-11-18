@@ -59,6 +59,22 @@ CREATE TABLE IF NOT EXISTS job_events (
     created_at REAL NOT NULL
 );
 
+-- Audit trail of label corrections.  A correction rewrites ``jobs.labels_json``;
+-- this table keeps the history of what was changed and which breakpoint was
+-- retained so the rollback is explainable after the fact.
+CREATE TABLE IF NOT EXISTS label_corrections (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id                TEXT NOT NULL,
+    record_index          INTEGER NOT NULL,
+    old_label             INTEGER NOT NULL,
+    new_label             INTEGER NOT NULL,
+    first_affected_step   INTEGER NOT NULL,
+    rolled_back_from_step INTEGER NOT NULL,
+    resumed_from_step     INTEGER NOT NULL,
+    created_at            REAL NOT NULL,
+    FOREIGN KEY (job_id) REFERENCES jobs(job_id)
+);
+
 CREATE TABLE IF NOT EXISTS workers (
     worker_id    TEXT PRIMARY KEY,
     status       TEXT NOT NULL,

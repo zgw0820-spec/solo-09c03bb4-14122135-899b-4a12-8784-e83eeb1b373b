@@ -12,6 +12,12 @@ database.  A batch commit writes, together and atomically:
 The append-only checkpoint stream is the source of truth.  A restart always
 reloads the newest checkpoint, and progress is only advanced by one inside the
 write lock, so no reader sees a step whose weights and progress disagree.
+
+A label correction is another such transaction: it rewinds the job to the
+breakpoint before the sample's first batch, deletes the breakpoints that were
+computed with the old label, rewrites the labels and recomputes the retained
+breakpoints' full-dataset losses.  Readers therefore never observe a job whose
+progress, weights, labels and losses disagree.
 """
 from __future__ import annotations
 
@@ -45,6 +51,22 @@ class JobNotFound(LookupError):
 
 class StateConflict(RuntimeError):
     """The database changed in a way that should be impossible."""
+
+
+class CorrectionRejected(RuntimeError):
+    """A label correction is not allowed in the job's current state."""
+
+    status_code = 409
+
+
+class LabelMismatch(CorrectionRejected):
+    """The caller's ``old_label`` is not the label currently stored."""
+
+
+class InvalidCorrection(CorrectionRejected):
+    """The record index or replacement label is out of range."""
+
+    status_code = 422
 
 
 def _dumps(values: np.ndarray) -> str:
@@ -173,6 +195,7 @@ def get_job(db_path, job_id: str) -> dict[str, Any] | None:
         "momentum": float(row["momentum"]),
         "loss": float(row["loss"]),
         "evaluation_loss": evaluation_loss,
+        "labels": [int(v) for v in targets],
         "weights": _loads(row["weights_json"]).tolist(),
         "momentum_velocity": _loads(row["velocity_json"]).tolist(),
         "final_weights": (
@@ -284,11 +307,16 @@ def advance_job(db_path, lease: Lease, batch_delay: float = 0.0) -> dict[str, An
         if row is None:
             raise JobNotFound(lease.job_id)
         if row["status"] == "completed":
+            # Another worker completed the job between this worker's poll and
+            # its lease acquisition.  Report the terminal state in the same
+            # shape as a normal commit; the worker uses ``step`` and ``loss``
+            # unconditionally.
             return {
                 "status": "completed",
                 "job_id": lease.job_id,
                 "step": int(row["completed_steps"]),
                 "total_steps": int(row["total_batches"]) * int(row["epochs"]),
+                "loss": float(row["loss"]),
                 "worker_id": lease.worker_id,
                 "lease_epoch": lease.epoch,
             }
@@ -380,6 +408,210 @@ def advance_job(db_path, lease: Lease, batch_delay: float = 0.0) -> dict[str, An
         "worker_id": lease.worker_id,
         "lease_epoch": lease.epoch,
     }
+
+
+def correct_label(
+    db_path,
+    job_id: str,
+    record_index: int,
+    old_label: int,
+    new_label: int,
+) -> dict[str, Any]:
+    """Correct one sample's label in a queued or running job.
+
+    The correction is applied as a rollback of the *training effect* of the
+    sample, not just an edit of the stored label:
+
+    * the first step whose batch contains ``record_index`` is computed from the
+      job's fixed batching (batch ``b`` of an epoch covers records
+      ``b*batch_size .. (b+1)*batch_size``);
+    * the job is rewound to the checkpoint *before* that step (step
+      ``first_affected_step - 1``), keeping that checkpoint's weights and
+      momentum, and every later checkpoint is deleted;
+    * if a retained checkpoint exists, its ``loss`` is recomputed against the
+      new label so the job row, the checkpoint stream and the full-data loss
+      all agree;
+    * ``labels_json`` is rewritten in the same transaction.
+
+    Consequently a resumed run computes every batch, from the first one that
+    includes the sample, with the corrected label, so the final weights are
+    bit-identical to training from scratch on the corrected data.  Weights and
+    momentum learned before the sample ever entered a batch are unaffected and
+    are reused.
+
+    Everything happens under one ``BEGIN IMMEDIATE`` transaction.  A batch
+    commit either happened before (and is then rolled back and its effect
+    discarded) or waits until after the correction, when it re-reads the labels
+    inside its own fenced transaction and therefore uses the new label.  An old
+    worker whose lease was taken over remains fenced by its lease epoch, so it
+    can never commit a result computed from the old label.  Completed jobs are
+    rejected.
+    """
+    with transaction(db_path) as conn:
+        row = _job_row(conn, job_id)
+        if row is None:
+            raise JobNotFound(job_id)
+        if row["status"] == "completed":
+            raise CorrectionRejected("completed jobs cannot be corrected")
+
+        record_count = int(row["record_count"])
+        if not (0 <= record_index < record_count):
+            raise InvalidCorrection(
+                f"record_index must be between 0 and {record_count - 1}"
+            )
+        if new_label not in (0, 1):
+            raise InvalidCorrection("new_label must be 0 or 1")
+
+        targets = [int(v) for v in json.loads(row["labels_json"])]
+        stored = targets[record_index]
+        if old_label != stored:
+            raise LabelMismatch(
+                f"record {record_index} has label {stored}, not the supplied old_label {old_label}"
+            )
+        if new_label == stored:
+            raise InvalidCorrection("new_label is identical to the stored label")
+
+        completed = int(row["completed_steps"])
+        batch_size = max(1, int(row["batch_size"]))
+        first_affected_step = (record_index // batch_size) + 1
+
+        # A batch at or after the one containing the sample depends on its
+        # label; batches are replayed in the same fixed order every epoch.
+        retained_step = (
+            first_affected_step - 1 if completed >= first_affected_step else completed
+        )
+
+        if retained_step > 0:
+            retained = conn.execute(
+                "SELECT step, weights_json, velocity_json FROM checkpoints "
+                "WHERE job_id=? AND step=?",
+                (job_id, retained_step),
+            ).fetchone()
+            if retained is None:
+                raise StateConflict(
+                    f"checkpoint {retained_step} that must be retained is missing"
+                )
+            weights = _loads(retained["weights_json"])
+            velocity = _loads(retained["velocity_json"])
+        else:
+            # Nothing has consumed the sample yet: start from the initial
+            # parameters (zero weights and momentum) rather than from the
+            # weights that were computed with the old label.
+            weights = np.zeros(int(row["feature_dim"]), dtype=np.float64)
+            velocity = np.zeros(int(row["feature_dim"]), dtype=np.float64)
+
+        targets[record_index] = new_label
+        design = np.asarray(json.loads(row["features_json"]), dtype=np.float64)
+        new_targets = np.asarray(targets, dtype=np.float64)
+        new_loss = dataset_loss(weights, design, new_targets)
+        now = time.time()
+
+        # Drop the breakpoints that were computed with the old label (step 1
+        # itself is dropped when it already consumed the sample).
+        conn.execute(
+            "DELETE FROM checkpoints WHERE job_id=? AND step>?",
+            (job_id, retained_step),
+        )
+        # Every retained breakpoint was computed by batches that did not contain
+        # the corrected sample, so its weights/momentum and batch loss stay
+        # valid.  Its *full-dataset* loss, however, was measured against the old
+        # label and must be recomputed so that a reader never sees a loss that
+        # disagrees with the stored labels.
+        retained_checkpoints = conn.execute(
+            "SELECT step, weights_json FROM checkpoints WHERE job_id=? AND step<=?",
+            (job_id, retained_step),
+        ).fetchall()
+        for checkpoint in retained_checkpoints:
+            checkpoint_loss = dataset_loss(
+                _loads(checkpoint["weights_json"]), design, new_targets
+            )
+            conn.execute(
+                "UPDATE checkpoints SET loss=? WHERE job_id=? AND step=?",
+                (checkpoint_loss, job_id, int(checkpoint["step"])),
+            )
+        completed_steps = retained_step
+        conn.execute(
+            """
+            UPDATE jobs
+               SET labels_json=?, weights_json=?, velocity_json=?, loss=?,
+                   completed_steps=?, status=?, updated_at=?, finished_at=NULL
+             WHERE job_id=? AND status IN ('queued','running')
+            """,
+            (
+                json.dumps([float(v) for v in targets], allow_nan=False),
+                _dumps(weights),
+                _dumps(velocity),
+                new_loss,
+                completed_steps,
+                "running" if completed_steps > 0 else "queued",
+                now,
+                job_id,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO label_corrections(
+                job_id, record_index, old_label, new_label, first_affected_step,
+                rolled_back_from_step, resumed_from_step, created_at
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                job_id,
+                record_index,
+                stored,
+                new_label,
+                first_affected_step,
+                completed,
+                completed_steps,
+                now,
+            ),
+        )
+        _event(
+            conn,
+            job_id,
+            "label_corrected",
+            {
+                "record_index": record_index,
+                "old_label": stored,
+                "new_label": new_label,
+                "first_affected_step": first_affected_step,
+                "rolled_back_from_step": completed,
+                "resumed_from_step": completed_steps,
+            },
+        )
+
+    return {
+        "job_id": job_id,
+        "record_index": record_index,
+        "old_label": stored,
+        "new_label": new_label,
+        "first_affected_step": first_affected_step,
+        "rolled_back_from_step": completed,
+        "resumed_from_step": completed_steps,
+        "deleted_checkpoints": completed - completed_steps,
+        "loss": new_loss,
+    }
+
+
+def list_corrections(db_path, job_id: str) -> list[dict[str, Any]]:
+    with reader(db_path) as conn:
+        if _job_row(conn, job_id) is None:
+            raise JobNotFound(job_id)
+        rows = conn.execute(
+            "SELECT * FROM label_corrections WHERE job_id=? ORDER BY id", (job_id,)
+        ).fetchall()
+    return [
+        {
+            "record_index": int(row["record_index"]),
+            "old_label": int(row["old_label"]),
+            "new_label": int(row["new_label"]),
+            "first_affected_step": int(row["first_affected_step"]),
+            "rolled_back_from_step": int(row["rolled_back_from_step"]),
+            "resumed_from_step": int(row["resumed_from_step"]),
+            "created_at": row["created_at"],
+        }
+        for row in rows
+    ]
 
 
 def record_event(db_path, job_id: str, event: str, detail: dict[str, Any] | None = None) -> None:

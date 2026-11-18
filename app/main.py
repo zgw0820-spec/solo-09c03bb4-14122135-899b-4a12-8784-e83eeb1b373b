@@ -30,9 +30,13 @@ app = FastAPI(
         "regression with batch size 8, learning rate 0.1 and momentum 0.9.\n\n"
         "All training is executed by workers. Every batch commits weights, "
         "momentum, loss and progress in one atomic checkpoint; after a failure "
-        "the next worker resumes from the newest committed checkpoint."
+        "the next worker resumes from the newest committed checkpoint.\n\n"
+        "Mis-labelled samples can be corrected through "
+        "`POST /jobs/{job_id}/corrections` while the job is queued or running; "
+        "training is rewound to the breakpoint before the sample's first batch "
+        "and the result equals training on the corrected data from scratch."
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -52,6 +56,29 @@ class TrainingRequest(BaseModel):
         examples=[[0, 0, 1, 1]],
     )
     epochs: int = Field(2, ge=2, le=5, description="Training epochs (2-5).")
+
+
+class LabelCorrectionRequest(BaseModel):
+    record_index: int = Field(
+        ...,
+        ge=0,
+        description="Zero-based index of the sample in the submitted record list.",
+        examples=[0],
+    )
+    old_label: int = Field(
+        ...,
+        ge=0,
+        le=1,
+        description="The label currently stored for this sample (optimistic check).",
+        examples=[0],
+    )
+    new_label: int = Field(
+        ...,
+        ge=0,
+        le=1,
+        description="The corrected label: 0 = healthy, 1 = shutdown warning.",
+        examples=[1],
+    )
 
 
 @app.get("/health", tags=["system"])
@@ -98,6 +125,40 @@ def get_checkpoints(
     """Batch checkpoints in step order, each with weights, momentum and loss."""
     try:
         return store.list_checkpoints(settings.db_path, job_id, after_step, limit)
+    except store.JobNotFound as exc:
+        raise HTTPException(status_code=404, detail="job not found") from exc
+
+
+@app.post("/jobs/{job_id}/corrections", tags=["training"])
+def correct_label(job_id: str, request: LabelCorrectionRequest) -> dict[str, Any]:
+    """Correct one sample's label while the job is queued or running.
+
+    If the sample has not yet entered a training batch, only the stored label
+    (and the loss of the retained breakpoints) changes.  Otherwise the job is
+    rewound to the checkpoint before the first batch that consumed the sample,
+    every later breakpoint is discarded, and training resumes from there with
+    the corrected label.  The resulting weights are identical to training from
+    scratch on the corrected data.  Completed jobs are rejected (409).
+    """
+    try:
+        return store.correct_label(
+            settings.db_path,
+            job_id,
+            request.record_index,
+            request.old_label,
+            request.new_label,
+        )
+    except store.JobNotFound as exc:
+        raise HTTPException(status_code=404, detail="job not found") from exc
+    except store.CorrectionRejected as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+
+@app.get("/jobs/{job_id}/corrections", tags=["training"])
+def get_corrections(job_id: str) -> list[dict[str, Any]]:
+    """All label corrections applied to a job, oldest first."""
+    try:
+        return store.list_corrections(settings.db_path, job_id)
     except store.JobNotFound as exc:
         raise HTTPException(status_code=404, detail="job not found") from exc
 

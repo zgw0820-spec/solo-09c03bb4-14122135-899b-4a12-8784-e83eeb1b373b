@@ -132,3 +132,48 @@ def test_worker_survives_a_crash_preventing_commit(tmp_path):
     epochs = [c["lease_epoch"] for c in checkpoints]
     assert epochs[:2] == [1, 1]
     assert epochs[2:] == [2] * 7
+
+
+def test_worker_ignores_a_job_completed_between_poll_and_claim(tmp_path, monkeypatch):
+    """``claimable_jobs`` is a snapshot; the job may finish before we claim it.
+
+    The worker must detect that and move on instead of crashing on a terminal
+    job (regression: ``advance_job``'s early completion result lacked ``loss``).
+    """
+    settings = make_settings(tmp_path)
+    init_db(settings.db_path)
+    job = store.create_job(settings.db_path, *sample(16, seed=13), 2)
+
+    # Another worker finishes the job while this one is between its claimable
+    # snapshot and the lease acquisition.
+    other = lm.acquire(settings.db_path, job["job_id"], "other", settings.lease_seconds)
+    while True:
+        if store.advance_job(settings.db_path, other)["status"] == "completed":
+            break
+    lm.release(settings.db_path, other)
+
+    original_claimable = store.claimable_jobs
+
+    def stale_claimable(db_path, limit=20):
+        # Simulate having read the list *before* the completion committed.
+        return [job["job_id"]]
+
+    monkeypatch.setattr(store, "claimable_jobs", stale_claimable)
+    worker, thread = run_worker(settings, "late")
+    try:
+        time.sleep(0.5)
+        assert thread.is_alive()
+    finally:
+        stop(worker, thread)
+    assert lm.holder(settings.db_path, job["job_id"]) is None
+    final = store.get_job(settings.db_path, job["job_id"])
+    assert final["status"] == "completed"
+    assert final["completed_steps"] == final["total_steps"]
+    starts = [
+        event
+        for event in store.list_events(settings.db_path, job["job_id"])
+        if event["event"] == "training_started"
+    ]
+    # The late worker never started training a finished job.
+    assert starts == []
+    monkeypatch.setattr(store, "claimable_jobs", original_claimable)

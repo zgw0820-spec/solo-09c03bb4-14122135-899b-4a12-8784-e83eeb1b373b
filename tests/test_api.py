@@ -115,3 +115,44 @@ def test_workers_endpoint_empty(client):
     assert "lease_seconds" in data
     assert data["workers"] == []
     assert data["leases"] == []
+
+
+def test_correction_rewinds_api_progress_and_checkpoints(client):
+    """The API snapshot, checkpoint stream and losses agree after a correction."""
+    job = client.post("/jobs", json=payload(16, 2)).json()
+    settings = Settings.from_env()
+
+    from app import lease as lm
+    from app import store
+
+    lm.register_worker(settings.db_path, "w1")
+    lease = lm.acquire(settings.db_path, job["job_id"], "w1", settings.lease_seconds)
+    for _ in range(3):
+        store.advance_job(settings.db_path, lease)
+
+    before = client.get(f"/jobs/{job['job_id']}").json()
+    corrected_label = 1 - before["labels"][9]
+    response = client.post(
+        f"/jobs/{job['job_id']}/corrections",
+        json={"record_index": 9, "old_label": before["labels"][9], "new_label": corrected_label},
+    )
+    assert response.status_code == 200
+
+    after = client.get(f"/jobs/{job['job_id']}").json()
+    checkpoints = client.get(f"/jobs/{job['job_id']}/checkpoints").json()
+    assert after["completed_steps"] == after["latest_checkpoint_step"] == 1
+    assert after["labels"][9] == corrected_label
+    assert [c["step"] for c in checkpoints] == [1]
+    assert checkpoints[0]["weights"] == after["weights"]
+    assert checkpoints[0]["momentum_velocity"] == after["momentum_velocity"]
+    assert checkpoints[0]["loss"] == pytest.approx(after["loss"], abs=1e-12)
+
+    remaining = 4 - after["completed_steps"]
+    for _ in range(remaining):
+        store.advance_job(settings.db_path, lease)
+    final = client.get(f"/jobs/{job['job_id']}").json()
+    assert final["status"] == "completed"
+    assert final["completed_steps"] == final["total_steps"] == 4
+    assert final["labels"][9] == corrected_label
+    assert final["loss"] == pytest.approx(final["evaluation_loss"], abs=1e-9)
+    assert [c["step"] for c in client.get(f"/jobs/{job['job_id']}/checkpoints").json()] == [1, 2, 3, 4]

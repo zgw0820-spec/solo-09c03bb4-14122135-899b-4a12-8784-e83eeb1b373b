@@ -6,6 +6,9 @@
 2. ``equivalence``: with real worker processes, kill one mid-training and prove
    the finished weights are bit-identical to an uninterrupted run.
 3. ``late``: a frozen (still-running) old worker cannot write after takeover.
+4. ``correction``: correct a label through the HTTP API mid-training, kill the
+   worker, let the other take over, and prove the result is bit-identical to
+   training from scratch on the corrected labels.
 
 Each check prints PASS/FAIL and exits non-zero if anything fails.
 """
@@ -167,16 +170,20 @@ def completed_state(port: int, job_id: str) -> dict:
     )
 
 
-def run_reference(tmp: Path) -> dict:
-    db = tmp / "reference.db"
+def run_job(db: Path, data: dict) -> dict:
+    """Train one job with a single worker, uninterrupted; return final state."""
     api, port = start_api(db)
     worker = start_worker(db, "solo")
     try:
-        job = post(port, "/jobs", dataset())
+        job = post(port, "/jobs", data)
         return completed_state(port, job["job_id"])
     finally:
         stop(worker)
         stop(api)
+
+
+def run_reference(tmp: Path) -> dict:
+    return run_job(tmp / "reference.db", dataset())
 
 
 def check_equivalence(tmp: Path) -> bool:
@@ -271,6 +278,100 @@ def check_late_worker(tmp: Path) -> bool:
     return True
 
 
+def check_correction(tmp: Path) -> bool:
+    """Correct a label mid-run, kill the owner, and compare with from-scratch."""
+    data = dataset(seed=33, records=40)
+    record = 23  # batch 3 -> two breakpoints survive the rollback
+    corrected_labels = list(data["labels"])
+    corrected_labels[record] = 1 - corrected_labels[record]
+    corrected_data = dict(data, labels=corrected_labels)
+
+    reference = run_job(tmp / "reference-corrected.db", corrected_data)
+
+    db = tmp / "correction.db"
+    api, port = start_api(db)
+    job = post(port, "/jobs", data)
+    worker_a = start_worker(db, "worker-a")
+    try:
+        wait_for(
+            lambda: get(port, f"/jobs/{job['job_id']}")["completed_steps"] >= 7,
+            60,
+            "training past the sample's batch",
+        )
+        old_label = get(port, f"/jobs/{job['job_id']}")["labels"][record]
+        result = post(
+            port,
+            f"/jobs/{job['job_id']}/corrections",
+            {"record_index": record, "old_label": old_label, "new_label": 1 - old_label},
+        )
+        assert result["first_affected_step"] == 3, result
+        assert result["resumed_from_step"] == 2, result
+        rewound = get(port, f"/jobs/{job['job_id']}")
+        assert rewound["completed_steps"] == 2, rewound
+        steps = [c["step"] for c in get(port, f"/jobs/{job['job_id']}/checkpoints")]
+        assert steps == [1, 2], steps
+        # Query consistency after the rollback.
+        assert rewound["latest_checkpoint_step"] == 2
+        assert rewound["labels"][record] == 1 - old_label
+        assert rewound["loss"] == get(port, f"/jobs/{job['job_id']}/checkpoints")[-1]["loss"]
+    finally:
+        stop(worker_a, hard=True)
+
+    worker_b = start_worker(db, "worker-b")
+    try:
+        final = completed_state(port, job["job_id"])
+        checkpoints = get(port, f"/jobs/{job['job_id']}/checkpoints")
+        events = get(port, f"/jobs/{job['job_id']}/events")
+    finally:
+        stop(worker_b)
+        stop(api)
+
+    assert final["final_weights"] == reference["final_weights"], (
+        final["final_weights"],
+        reference["final_weights"],
+    )
+    assert final["momentum_velocity"] == reference["momentum_velocity"]
+    assert final["loss"] == reference["loss"]
+    assert [c["step"] for c in checkpoints] == list(range(1, final["total_steps"] + 1))
+    assert {c["worker_id"] for c in checkpoints} == {"worker-a", "worker-b"}
+    assert max(c["step"] for c in checkpoints if c["worker_id"] == "worker-a") == 2
+    assert any(e["event"] == "label_corrected" for e in events)
+    print(
+        f"  PASS: sample {record} relabelled at step 7, rewound to step 2,"
+        f" worker-b finished; weights match from-scratch training"
+    )
+    return True
+
+
+def check_correction_rejected_after_completion(tmp: Path) -> bool:
+    db = tmp / "correction-done.db"
+    api, port = start_api(db)
+    worker = start_worker(db, "solo")
+    try:
+        data = dataset(seed=44, records=16)
+        job = post(port, "/jobs", data)
+        completed_state(port, job["job_id"])
+        old_label = get(port, f"/jobs/{job['job_id']}")["labels"][0]
+        try:
+            post(
+                port,
+                f"/jobs/{job['job_id']}/corrections",
+                {"record_index": 0, "old_label": old_label, "new_label": 1 - old_label},
+            )
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 409, exc.code
+        else:
+            raise AssertionError("completed job accepted a correction")
+        state = get(port, f"/jobs/{job['job_id']}")
+        assert state["status"] == "completed"
+        assert state["labels"] == data["labels"]
+    finally:
+        stop(worker)
+        stop(api)
+    print("  PASS: correcting a completed job returns HTTP 409 and changes nothing")
+    return True
+
+
 def main() -> int:
     failures = []
     with tempfile.TemporaryDirectory() as raw:
@@ -279,6 +380,11 @@ def main() -> int:
             ("compose", check_compose),
             ("killed-worker equivalence", lambda: check_equivalence(tmp)),
             ("late-worker fencing", lambda: check_late_worker(tmp)),
+            ("label correction + takeover", lambda: check_correction(tmp)),
+            (
+                "completed job rejects correction",
+                lambda: check_correction_rejected_after_completion(tmp),
+            ),
         ):
             print(f"[{name}]")
             try:
